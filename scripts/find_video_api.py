@@ -28,7 +28,6 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-# Words that often appear near video-search APIs
 VIDEO_HINTS = (
     "video",
     "videos",
@@ -72,7 +71,6 @@ API_HINTS = (
     "v3",
 )
 
-# Absolute / relative URL-looking API paths inside JS/HTML
 URL_PATTERN = re.compile(
     r"""(?P<quote>['"`])
         (?P<url>
@@ -85,7 +83,6 @@ URL_PATTERN = re.compile(
     re.VERBOSE,
 )
 
-# fetch("/api/..."), axios.get(`...`), $.ajax({url: "..."})
 CALL_PATTERN = re.compile(
     r"""(?P<fn>
             fetch
@@ -104,7 +101,6 @@ CALL_PATTERN = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
-# "baseURL": "https://api.example.com", endpoint: "/videos/search"
 KEYED_URL_PATTERN = re.compile(
     r"""(?P<key>
             (?:base)?url
@@ -144,6 +140,27 @@ class Finding:
     context: str
 
 
+def log(msg: str) -> None:
+    """Progress logs always go to stderr so --json stdout stays clean."""
+    print(msg, file=sys.stderr, flush=True)
+
+
+def log_step(msg: str) -> None:
+    log(f"→ {msg}")
+
+
+def log_ok(msg: str) -> None:
+    log(f"✓ Успех: {msg}")
+
+
+def log_fail(msg: str) -> None:
+    log(f"✗ Ошибка: {msg}")
+
+
+def log_info(msg: str) -> None:
+    log(f"• {msg}")
+
+
 def normalize_url(page_url: str, raw: str) -> str | None:
     raw = raw.strip()
     if not raw or raw.startswith(("javascript:", "data:", "mailto:", "#")):
@@ -152,7 +169,6 @@ def normalize_url(page_url: str, raw: str) -> str | None:
         raw = f"{urlparse(page_url).scheme}:{raw}"
     if raw.startswith(("http://", "https://", "/")):
         return urljoin(page_url, raw)
-    # relative API-looking path without leading slash
     if re.match(r"^(api|graphql|gql|v\d+)/", raw, re.I):
         return urljoin(page_url, "/" + raw)
     return None
@@ -190,7 +206,6 @@ def looks_like_asset(url: str) -> bool:
 
 
 def score_candidate(url: str, context: str) -> tuple[int, list[str]]:
-    """Score mostly by URL path; context only adds mild bonus."""
     url_l = url.lower()
     ctx_l = context.lower()
     score = 0
@@ -230,7 +245,6 @@ def score_candidate(url: str, context: str) -> tuple[int, list[str]]:
         score += 1
         reasons.append("data response")
 
-    # Drop weak matches that are only from nearby comments/code context
     if score < 3:
         return score, reasons
     if not any(
@@ -305,20 +319,35 @@ def extract_from_text(text: str, page_url: str, source: str) -> list[Finding]:
     return findings
 
 
-def fetch_text(session: requests.Session, url: str) -> str | None:
+def fetch_text(session: requests.Session, url: str, label: str) -> str | None:
+    log_step(f"Загружаю {label}: {url}")
     try:
         response = session.get(url, timeout=DEFAULT_TIMEOUT)
         response.raise_for_status()
         content = response.content
+        truncated = False
         if len(content) > MAX_JS_BYTES:
             content = content[:MAX_JS_BYTES]
-        return content.decode(response.encoding or "utf-8", errors="replace")
+            truncated = True
+        text = content.decode(response.encoding or "utf-8", errors="replace")
+        size_kb = len(content) / 1024
+        extra = " (обрезано по лимиту)" if truncated else ""
+        log_ok(f"{label} загружен — HTTP {response.status_code}, {size_kb:.1f} KB{extra}")
+        return text
+    except requests.Timeout:
+        log_fail(f"{label} — таймаут ({DEFAULT_TIMEOUT}s): {url}")
+        return None
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "?"
+        log_fail(f"{label} — HTTP {status}: {url}")
+        return None
     except requests.RequestException as exc:
-        print(f"[warn] failed to fetch {url}: {exc}", file=sys.stderr)
+        log_fail(f"{label} — сеть/запрос: {exc}")
         return None
 
 
 def collect_script_urls(soup: BeautifulSoup, page_url: str) -> list[str]:
+    log_step("Ищу внешние <script src=...> на странице")
     urls: list[str] = []
     for tag in soup.find_all("script", src=True):
         src = tag.get("src")
@@ -327,44 +356,111 @@ def collect_script_urls(soup: BeautifulSoup, page_url: str) -> list[str]:
         full = urljoin(page_url, src)
         if urlparse(full).scheme in ("http", "https"):
             urls.append(full)
-    # de-dupe, keep order
+
     seen: set[str] = set()
     ordered: list[str] = []
     for url in urls:
         if url not in seen:
             seen.add(url)
             ordered.append(url)
-    return ordered[:MAX_JS_FILES]
+
+    limited = ordered[:MAX_JS_FILES]
+    if not limited:
+        log_info("Внешние JS-файлы не найдены")
+    else:
+        log_ok(f"Найдено внешних JS: {len(ordered)}" + (
+            f" (беру первые {MAX_JS_FILES})" if len(ordered) > MAX_JS_FILES else ""
+        ))
+        for i, url in enumerate(limited, start=1):
+            log_info(f"JS [{i}/{len(limited)}]: {url}")
+    return limited
 
 
 def analyze_page(page_url: str) -> list[Finding]:
+    log("=" * 60)
+    log_step(f"Старт анализа страницы: {page_url}")
+    log("=" * 60)
+
     session = requests.Session()
     session.headers.update(HEADERS)
 
-    html = fetch_text(session, page_url)
+    html = fetch_text(session, page_url, label="HTML страницы")
     if html is None:
-        raise SystemExit(f"Cannot load page: {page_url}")
+        log_fail("Не удалось загрузить страницу — анализ остановлен")
+        raise SystemExit(1)
 
-    soup = BeautifulSoup(html, "html.parser")
-    findings = extract_from_text(html, page_url, source=page_url)
+    log_step("Парсю HTML")
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        log_ok("HTML успешно разобран")
+    except Exception as exc:  # noqa: BLE001 - surface parse issues to user
+        log_fail(f"Не удалось разобрать HTML: {exc}")
+        raise SystemExit(1) from exc
 
-    for i, script in enumerate(soup.find_all("script"), start=1):
-        if script.get("src"):
-            continue
+    findings: list[Finding] = []
+
+    log_step("Сканирую HTML на API-ссылки")
+    html_hits = extract_from_text(html, page_url, source=page_url)
+    findings.extend(html_hits)
+    if html_hits:
+        log_ok(f"В HTML найдено кандидатов: {len(html_hits)}")
+    else:
+        log_info("В HTML кандидатов не найдено")
+
+    inline_scripts = [
+        (i, script)
+        for i, script in enumerate(soup.find_all("script"), start=1)
+        if not script.get("src")
+    ]
+    log_step(f"Проверяю inline-скрипты (всего тегов без src: {len(inline_scripts)})")
+    inline_scanned = 0
+    inline_hits_total = 0
+    for i, script in inline_scripts:
         inline = script.string or script.get_text() or ""
         if len(inline.strip()) < 20:
             continue
-        findings.extend(
-            extract_from_text(inline, page_url, source=f"{page_url}#inline-script-{i}")
+        inline_scanned += 1
+        log_step(f"Сканирую inline-скрипт #{i} ({len(inline)} символов)")
+        hits = extract_from_text(inline, page_url, source=f"{page_url}#inline-script-{i}")
+        findings.extend(hits)
+        if hits:
+            log_ok(f"Inline #{i}: найдено кандидатов — {len(hits)}")
+            inline_hits_total += len(hits)
+        else:
+            log_info(f"Inline #{i}: кандидатов нет")
+
+    if inline_scanned == 0:
+        log_info("Подходящих inline-скриптов нет")
+    else:
+        log_ok(
+            f"Inline-скрипты обработаны: {inline_scanned}, "
+            f"кандидатов суммарно: {inline_hits_total}"
         )
 
-    for js_url in collect_script_urls(soup, page_url):
-        js_text = fetch_text(session, js_url)
+    js_urls = collect_script_urls(soup, page_url)
+    js_ok = 0
+    js_fail = 0
+    js_hits_total = 0
+    for idx, js_url in enumerate(js_urls, start=1):
+        js_text = fetch_text(session, js_url, label=f"JS [{idx}/{len(js_urls)}]")
         if not js_text:
+            js_fail += 1
             continue
-        findings.extend(extract_from_text(js_text, page_url, source=js_url))
+        js_ok += 1
+        log_step(f"Сканирую JS [{idx}/{len(js_urls)}]")
+        hits = extract_from_text(js_text, page_url, source=js_url)
+        findings.extend(hits)
+        if hits:
+            log_ok(f"JS [{idx}/{len(js_urls)}]: найдено кандидатов — {len(hits)}")
+            js_hits_total += len(hits)
+        else:
+            log_info(f"JS [{idx}/{len(js_urls)}]: кандидатов нет")
 
-    # merge duplicates, keep best score / richest reasons
+    if js_urls:
+        log_info(f"JS загружено успешно: {js_ok}, с ошибкой: {js_fail}")
+        log_info(f"Кандидатов из внешних JS: {js_hits_total}")
+
+    log_step("Объединяю и ранжирую результаты")
     best: dict[tuple[str, str], Finding] = {}
     for item in findings:
         key = (item.url, item.kind)
@@ -374,7 +470,9 @@ def analyze_page(page_url: str) -> list[Finding]:
         ):
             best[key] = item
 
-    return sorted(best.values(), key=lambda x: (-x.score, x.url))
+    merged = sorted(best.values(), key=lambda x: (-x.score, x.url))
+    log_ok(f"После объединения уникальных записей: {len(merged)}")
+    return merged
 
 
 def filter_video_search(findings: Iterable[Finding], min_score: int) -> list[Finding]:
@@ -383,7 +481,6 @@ def filter_video_search(findings: Iterable[Finding], min_score: int) -> list[Fin
         if item.score < min_score:
             continue
         reasons = set(item.reasons)
-        # Prefer things tied to video and/or search APIs
         if (
             "video-related" in reasons
             or "search-related" in reasons
@@ -407,12 +504,16 @@ def dedupe_by_url(findings: list[Finding]) -> list[Finding]:
 
 
 def print_report(findings: list[Finding]) -> None:
+    print()
+    print("=" * 60)
     if not findings:
-        print("Ничего похожего на video/search API не найдено в HTML/JS.")
-        print("Подсказка: часть API грузится только после действий в браузере — смотрите Network.")
+        print("Итог: ничего похожего на video/search API не найдено.")
+        print("Подсказка: часть API грузится только в браузере — смотрите Network.")
+        print("=" * 60)
         return
 
-    print(f"Найдено кандидатов: {len(findings)}\n")
+    print(f"Итог: найдено кандидатов — {len(findings)}")
+    print("=" * 60)
     reason_counter: Counter[str] = Counter()
     for item in findings:
         reason_counter.update(item.reasons)
@@ -426,6 +527,7 @@ def print_report(findings: list[Finding]) -> None:
     print("Частые признаки:")
     for reason, count in reason_counter.most_common(8):
         print(f"  {reason}: {count}")
+    print("=" * 60)
 
 
 def parse_args() -> argparse.Namespace:
@@ -451,22 +553,37 @@ def parse_args() -> argparse.Namespace:
         "--json",
         dest="as_json",
         action="store_true",
-        help="Вывести результат в JSON",
+        help="Вывести результат в JSON (прогресс всё равно в терминал)",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    log_step("Запуск find_video_api")
+    log_info(f"Цель: {args.url}")
+    log_info(f"Режим: {'все API' if args.all_api else 'video/search'}, min-score={args.min_score}")
+
     findings = analyze_page(args.url)
+
+    log_step("Фильтрую кандидатов")
+    before = len(findings)
     if not args.all_api:
         findings = filter_video_search(findings, min_score=args.min_score)
     else:
         findings = [f for f in findings if f.score >= args.min_score]
     findings = dedupe_by_url(findings)
+    log_ok(f"Фильтрация завершена: было {before}, осталось {len(findings)}")
+
+    if findings:
+        log_ok(f"Анализ завершён успешно — найдено {len(findings)} API-кандидатов")
+    else:
+        log_info("Анализ завершён: подходящих API не найдено")
 
     if args.as_json:
+        log_step("Печатаю JSON-результат в stdout")
         print(json.dumps([asdict(f) for f in findings], ensure_ascii=False, indent=2))
+        log_ok("JSON выведен")
     else:
         print_report(findings)
 
