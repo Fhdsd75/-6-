@@ -10,6 +10,7 @@ import re
 import sys
 from collections import Counter, deque
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Iterable
 from urllib.parse import urljoin, urlparse
 
@@ -581,17 +582,16 @@ def perform_login(page, username: str, password: str, login_url: str | None) -> 
     log_step("Пробую войти как пользователь (browser login)")
     if login_url:
         log_step(f"Открываю страницу логина: {login_url}")
-        page.goto(login_url, wait_until="networkidle", timeout=60000)
+        page.goto(login_url, wait_until="domcontentloaded", timeout=60000)
 
     if not login_form_visible(page):
-        # some SPAs show login via hash tab
-        for selector in ['a[href="#login"]', 'text=Вход', 'text=Войти']:
+        for selector in ['a[href="#login"]', "text=Вход", "text=Войти"]:
             try:
                 loc = page.locator(selector).first
                 if loc.count() > 0 and loc.is_visible():
                     log_info(f"Кликаю вкладку/ссылку входа: {selector}")
                     loc.click()
-                    page.wait_for_timeout(500)
+                    page.wait_for_timeout(300)
                     break
             except Exception:  # noqa: BLE001
                 continue
@@ -610,48 +610,50 @@ def perform_login(page, username: str, password: str, login_url: str | None) -> 
     ).first
 
     log_step(f"Ввожу логин: {username}")
-    user_input.fill("")
     user_input.fill(username)
     log_step("Ввожу пароль: ********")
-    pass_input.fill("")
     pass_input.fill(password)
 
     before_url = page.url
-    log_step('Нажимаю "Войти"')
-    submit.click()
+    log_step('Нажимаю "Войти" и жду /api/v2/login')
+    try:
+        with page.expect_response(
+            lambda r: "/api/" in r.url and "login" in r.url.lower() and r.request.method == "POST",
+            timeout=LOGIN_TIMEOUT_MS,
+        ) as resp_info:
+            submit.click()
+        resp = resp_info.value
+        log_info(f"Ответ логина: HTTP {resp.status} {resp.url}")
+        if resp.status >= 400:
+            body = ""
+            try:
+                body = resp.text()[:200]
+            except Exception:  # noqa: BLE001
+                pass
+            log_fail(f"Логин отклонён сервером: HTTP {resp.status} {body}")
+            raise SystemExit(1)
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        log_fail(f"Не дождался ответа login API: {exc}")
+        raise SystemExit(1) from exc
 
-    # wait until login form disappears or URL/title changes away from login
-    deadline_error = None
     try:
         page.wait_for_function(
             """() => {
                 const title = (document.title || '').toLowerCase();
                 const hasPass = !!document.querySelector('input[type="password"]');
-                const loginTitle = title.includes('вход') || title.includes('login');
-                return !(hasPass && loginTitle);
+                return !(hasPass && (title.includes('вход') || title.includes('login')));
             }""",
-            timeout=LOGIN_TIMEOUT_MS,
+            timeout=15000,
         )
-        page.wait_for_load_state("networkidle", timeout=30000)
-    except Exception as exc:  # noqa: BLE001
-        deadline_error = exc
+    except Exception:  # noqa: BLE001
+        pass
 
+    page.wait_for_load_state("networkidle", timeout=20000)
     still_login = login_form_visible(page) or "вход" in (page.title() or "").lower()
     if still_login:
-        # try to capture visible error text
-        err = ""
-        for sel in [".alert", ".error", "[class*='error']", "[class*='invalid']", "form"]:
-            try:
-                text = page.locator(sel).first.inner_text(timeout=1000)
-                if text and len(text) < 300 and ("ошиб" in text.lower() or "невер" in text.lower() or "парол" in text.lower()):
-                    err = text.strip()
-                    break
-            except Exception:  # noqa: BLE001
-                continue
-        details = f" ({err})" if err else ""
-        log_fail(f"Логин не удался — всё ещё страница входа{details}")
-        if deadline_error:
-            log_info(f"Детали ожидания: {deadline_error}")
+        log_fail("Логин не удался — всё ещё страница входа")
         raise SystemExit(1)
 
     log_ok(f"Вход выполнен. URL сейчас: {page.url} (было: {before_url})")
@@ -744,14 +746,21 @@ def capture_with_browser(
                 if username and password:
                     if login_form_visible(page) or login_url:
                         perform_login(page, username, password, login_url=login_url)
-                        log_step(f"Перехожу на целевую страницу после логина: {page_url}")
-                        page.goto(page_url, wait_until="networkidle", timeout=60000)
-                        if login_form_visible(page):
-                            log_fail("После логина целевая страница снова показывает форму входа")
-                            raise SystemExit(1)
-                        log_ok(
-                            f"Целевая страница открыта под пользователем: {page.url} | {page.title()}"
-                        )
+                        # If SPA already opened the target after login, skip extra navigation.
+                        already_there = page_url.rstrip("/") in page.url.rstrip("/") and not login_form_visible(page)
+                        if already_there:
+                            log_ok(
+                                f"Уже на целевой странице под пользователем: {page.url} | {page.title()}"
+                            )
+                        else:
+                            log_step(f"Перехожу на целевую страницу после логина: {page_url}")
+                            page.goto(page_url, wait_until="networkidle", timeout=60000)
+                            if login_form_visible(page):
+                                log_fail("После логина целевая страница снова показывает форму входа")
+                                raise SystemExit(1)
+                            log_ok(
+                                f"Целевая страница открыта под пользователем: {page.url} | {page.title()}"
+                            )
                     else:
                         log_info(
                             "Форма логина не нужна — похоже, уже авторизованы или логин не требуется"
@@ -761,6 +770,36 @@ def capture_with_browser(
 
                 log_step("Жду дополнительные загрузки после открытия")
                 page.wait_for_timeout(wait_ms)
+
+                # Extra signal: video list API under student session.
+                try:
+                    video_api = page.evaluate(
+                        """async () => {
+                            const r = await fetch('/api/students/videos', {credentials:'include'});
+                            const text = await r.text();
+                            return {status:r.status, url:r.url, body:text.slice(0,300)};
+                        }"""
+                    )
+                    videos_url = urljoin(page_url, "/api/students/videos")
+                    if isinstance(video_api, dict) and video_api.get("status") == 200:
+                        log_ok(
+                            f"Под пользователем доступен /api/students/videos: "
+                            f"{video_api.get('body', '')[:120]}"
+                        )
+                        network_findings.append(
+                            Finding(
+                                url=videos_url,
+                                source=f"browser:{page_url}",
+                                kind="runtime:probe",
+                                score=12,
+                                reasons=("api-like", "video-related", "/api path", "seen-in-browser"),
+                                context="authenticated probe /api/students/videos",
+                            )
+                        )
+                    else:
+                        log_info(f"Проба /api/students/videos: {video_api}")
+                except Exception as exc:  # noqa: BLE001
+                    log_info(f"Проба /api/students/videos не удалась: {exc}")
 
                 for src in page.eval_on_selector_all(
                     "script[src]",
@@ -950,7 +989,30 @@ def print_report(findings: list[Finding]) -> None:
     print("=" * 60)
 
 
+def load_local_credentials() -> None:
+    """Load gitignored local env file so reruns are fast without CLI args."""
+    candidates = (
+        Path(__file__).resolve().parent / ".local_credentials.env",
+        Path.cwd() / ".local_credentials.env",
+    )
+    for path in candidates:
+        if not path.is_file():
+            continue
+        log_info(f"Читаю локальные credentials: {path}")
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip("'\"")
+            if key and key not in os.environ:
+                os.environ[key] = value
+        return
+
+
 def parse_args() -> argparse.Namespace:
+    load_local_credentials()
     parser = argparse.ArgumentParser(
         description=(
             "Сканирует HTML и JS (включая связанные/динамические файлы) "

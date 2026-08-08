@@ -7,3 +7,6 @@ venv/
 downloaded_videos/
 *.mp4
 .api_findings.json
+.local_credentials.env
+scripts/.local_credentials.env
+*.credentials.env
