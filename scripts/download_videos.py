@@ -68,10 +68,21 @@ def load_local_credentials() -> None:
         return
 
 
-def safe_name(text: str, max_len: int = 80) -> str:
+def safe_name(text: str, max_len: int = 60) -> str:
+    """Keep names short: Linux filename limit is 255 bytes, Cyrillic is multibyte."""
     text = re.sub(r"[\\/:*?\"<>|]+", " ", text)
     text = re.sub(r"\s+", " ", text).strip(" .")
-    return (text or "video")[:max_len]
+    text = text or "video"
+    # Trim by UTF-8 bytes, not Python chars.
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_len:
+        return text
+    cut = encoded[:max_len]
+    while True:
+        try:
+            return cut.decode("utf-8").rstrip(" .")
+        except UnicodeDecodeError:
+            cut = cut[:-1]
 
 
 @dataclass
@@ -85,7 +96,14 @@ class VideoItem:
 
     @property
     def local_name(self) -> str:
-        return f"{safe_name(self.section)} — {safe_name(self.name)}.mp4"
+        # Keep whole filename under ~180 UTF-8 bytes to avoid ENAMETOOLONG.
+        section = safe_name(self.section, max_len=70)
+        name = safe_name(self.name, max_len=90)
+        short_id = (self.video_id or "vid")[:8]
+        candidate = f"{section} — {name}.mp4"
+        if len(candidate.encode("utf-8")) <= 180:
+            return candidate
+        return f"{safe_name(self.name, max_len=140)} [{short_id}].mp4"
 
     @property
     def candidate_urls(self) -> list[str]:
@@ -224,9 +242,10 @@ def download_one(
             cmd = [
                 "curl",
                 "-L",
+                "--http1.1",
                 "--fail",
                 "--retry",
-                "5",
+                "8",
                 "--retry-delay",
                 "2",
                 "--retry-all-errors",
