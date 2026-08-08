@@ -20,8 +20,9 @@ CDN_BASE = "https://cdn.rulionline.ru/videos/"
 API_VIDEOS = "/api/students/videos"
 DEFAULT_OUT = "downloaded_videos"
 DEFAULT_QUALITY = "full"  # full | original | small
-MAX_WORKERS = 4
-TIMEOUT = (15, 120)
+MAX_WORKERS = 2
+TIMEOUT = (20, 180)
+RETRY_SLEEP_SEC = 1.5
 
 HEADERS = {
     "User-Agent": (
@@ -80,10 +81,19 @@ class VideoItem:
     video_id: str
     filename_remote: str
     url: str
+    fallback_urls: tuple[str, ...] = ()
 
     @property
     def local_name(self) -> str:
         return f"{safe_name(self.section)} — {safe_name(self.name)}.mp4"
+
+    @property
+    def candidate_urls(self) -> list[str]:
+        out: list[str] = []
+        for url in (self.url, *self.fallback_urls):
+            if url and url not in out:
+                out.append(url)
+        return out
 
 
 def login_and_fetch_videos(base_url: str, username: str, password: str) -> list[dict]:
@@ -135,21 +145,35 @@ def login_and_fetch_videos(base_url: str, username: str, password: str) -> list[
 
 
 def build_items(groups: list[dict], quality: str) -> list[VideoItem]:
-    field = QUALITY_FIELD[quality]
+    preferred = QUALITY_FIELD[quality]
+    # Prefer requested quality, then smaller/faster fallbacks, then original.
+    order = [preferred, "linkFull", "linkSmall", "linkOriginal"]
+    dedup_order: list[str] = []
+    for key in order:
+        if key not in dedup_order:
+            dedup_order.append(key)
+
     items: list[VideoItem] = []
     for group in groups:
         section = group.get("name") or "section"
         for video in group.get("videos") or []:
-            remote = video.get(field)
-            if not remote:
+            remotes = [video.get(k) for k in dedup_order if video.get(k)]
+            # unique preserve order
+            uniq: list[str] = []
+            for remote in remotes:
+                if remote not in uniq:
+                    uniq.append(remote)
+            if not uniq:
                 continue
+            urls = [urljoin(CDN_BASE, remote) for remote in uniq]
             items.append(
                 VideoItem(
                     section=section,
                     name=video.get("name") or video.get("_id") or "video",
                     video_id=str(video.get("_id") or ""),
-                    filename_remote=remote,
-                    url=urljoin(CDN_BASE, remote),
+                    filename_remote=uniq[0],
+                    url=urls[0],
+                    fallback_urls=tuple(urls[1:]),
                 )
             )
     return items
@@ -170,50 +194,80 @@ def unique_path(out_dir: Path, item: VideoItem, used: set[str]) -> Path:
         n += 1
 
 
-def download_one(session: requests.Session, item: VideoItem, path: Path) -> tuple[str, str]:
+def download_one(
+    session: requests.Session,
+    item: VideoItem,
+    path: Path,
+    retries: int = 8,
+) -> tuple[str, str]:
+    """Download via curl resume — more stable than requests on this CDN."""
+    import subprocess
+    import time
+
+    del session  # unused; kept for call-site compatibility
     part = path.with_suffix(path.suffix + ".part")
-    existing = part.stat().st_size if part.exists() else 0
     if path.exists() and path.stat().st_size > 0 and not part.exists():
         return item.local_name, "skip"
 
-    headers = dict(HEADERS)
-    if existing > 0:
-        headers["Range"] = f"bytes={existing}-"
+    last_err = "unknown"
+    for url in item.candidate_urls:
+        # Probe availability quickly
+        try:
+            probe = requests.head(url, headers=HEADERS, timeout=20, allow_redirects=True)
+            if probe.status_code == 404:
+                last_err = f"HTTP 404 for {url}"
+                continue
+        except Exception as exc:  # noqa: BLE001
+            last_err = str(exc)
 
-    try:
-        with session.get(item.url, headers=headers, stream=True, timeout=TIMEOUT) as resp:
-            if resp.status_code == 416:
-                # already complete according to server
-                if part.exists():
-                    part.replace(path)
-                return item.local_name, "done"
-            if resp.status_code not in (200, 206):
-                return item.local_name, f"fail HTTP {resp.status_code}"
+        for attempt in range(1, retries + 1):
+            cmd = [
+                "curl",
+                "-L",
+                "--fail",
+                "--retry",
+                "5",
+                "--retry-delay",
+                "2",
+                "--retry-all-errors",
+                "-C",
+                "-",
+                "-A",
+                HEADERS["User-Agent"],
+                "-H",
+                f"Referer: {HEADERS['Referer']}",
+                "-o",
+                str(part),
+                url,
+            ]
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                if proc.returncode != 0:
+                    err = (proc.stderr or proc.stdout or "").strip().splitlines()
+                    last_err = err[-1] if err else f"curl exit {proc.returncode}"
+                    # 404 from curl
+                    if "404" in last_err or proc.returncode == 22:
+                        break
+                    log(f"• retry {attempt}/{retries} for {item.local_name}: {last_err}")
+                    time.sleep(RETRY_SLEEP_SEC)
+                    continue
 
-            mode = "ab" if resp.status_code == 206 and existing > 0 else "wb"
-            if mode == "wb" and part.exists():
-                existing = 0
-            total = int(resp.headers.get("content-length") or 0)
-            if resp.status_code == 206:
-                # content-length is remaining bytes
-                total_all = existing + total
-            else:
-                total_all = total
+                if not part.exists() or part.stat().st_size <= 0:
+                    last_err = "empty file"
+                    time.sleep(RETRY_SLEEP_SEC)
+                    continue
 
-            written = existing
-            with open(part, mode) as fh:
-                for chunk in resp.iter_content(chunk_size=1024 * 256):
-                    if not chunk:
-                        continue
-                    fh.write(chunk)
-                    written += len(chunk)
+                part.replace(path)
+                mb = path.stat().st_size / (1024 * 1024)
+                suffix = "" if url == item.url else " (fallback)"
+                return item.local_name, f"ok {mb:.1f} MB{suffix}"
+            except Exception as exc:  # noqa: BLE001
+                last_err = str(exc)
+                log(f"• retry {attempt}/{retries} for {item.local_name}: {last_err}")
+                time.sleep(RETRY_SLEEP_SEC)
+                continue
 
-            part.replace(path)
-            mb = written / (1024 * 1024)
-            total_mb = total_all / (1024 * 1024) if total_all else mb
-            return item.local_name, f"ok {mb:.1f}/{total_mb:.1f} MB"
-    except Exception as exc:  # noqa: BLE001
-        return item.local_name, f"fail {exc}"
+    return item.local_name, f"fail {last_err}"
 
 
 def parse_args() -> argparse.Namespace:
