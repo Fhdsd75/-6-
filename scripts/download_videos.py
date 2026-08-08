@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -56,16 +57,25 @@ def load_local_credentials() -> None:
     for path in candidates:
         if not path.is_file():
             continue
-        for raw in path.read_text(encoding="utf-8").splitlines():
-            line = raw.strip()
+        log(f"• Читаю credentials: {path}")
+        # utf-8-sig strips Windows BOM from PowerShell Set-Content -Encoding UTF8
+        for raw in path.read_text(encoding="utf-8-sig").splitlines():
+            line = raw.strip().lstrip("\ufeff")
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, value = line.split("=", 1)
-            key = key.strip()
+            key = key.strip().lstrip("\ufeff")
             value = value.strip().strip("'\"")
             if key and key not in os.environ:
                 os.environ[key] = value
         return
+
+
+def curl_bin() -> str:
+    # On Windows PowerShell, `curl` is an alias to Invoke-WebRequest.
+    if os.name == "nt":
+        return shutil.which("curl.exe") or "curl.exe"
+    return shutil.which("curl") or "curl"
 
 
 def safe_name(text: str, max_len: int = 60) -> str:
@@ -240,7 +250,7 @@ def download_one(
 
         for attempt in range(1, retries + 1):
             cmd = [
-                "curl",
+                curl_bin(),
                 "-L",
                 "--http1.1",
                 "--fail",
@@ -327,12 +337,23 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    log("→ Старт download_videos.py")
+    log(f"• Python: {sys.executable}")
+    log(f"• Папка запуска: {Path.cwd()}")
     args = parse_args()
-    if not args.username or not args.password:
-        raise SystemExit("Нужны username/password или scripts/.local_credentials.env")
 
-    out_dir = Path(args.out)
+    out_dir = Path(args.out).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    log(f"• Папка для видео: {out_dir}")
+
+    if not args.username or not args.password:
+        log("✗ Нет логина/пароля")
+        log("  Создай scripts\\.local_credentials.env или передай --username/--password")
+        raise SystemExit(2)
+
+    log(f"• Логин: {args.username}")
+    log(f"• quality={args.quality}, workers={args.workers}")
+    log(f"• curl: {curl_bin()}")
 
     groups = login_and_fetch_videos(args.base_url, args.username, args.password)
     items = build_items(groups, args.quality)
