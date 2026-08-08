@@ -1,2 +1,9 @@
 /build
 /logs
+__pycache__/
+*.pyc
+.venv/
+venv/
+downloaded_videos/
+*.mp4
+.api_findings.json
