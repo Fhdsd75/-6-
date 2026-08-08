@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from collections import Counter, deque
@@ -19,6 +20,7 @@ DEFAULT_TIMEOUT = 20
 MAX_JS_FILES = 80
 MAX_JS_BYTES = 2_000_000
 DEFAULT_BROWSER_WAIT_MS = 4000
+LOGIN_TIMEOUT_MS = 45000
 
 HEADERS = {
     "User-Agent": (
@@ -566,10 +568,117 @@ def crawl_js_queue(
         log_info("Нечего обходить: очередь JS пуста")
 
 
+def login_form_visible(page) -> bool:
+    user = page.locator('input[name="username"], input[type="email"], input[placeholder*="почт" i]')
+    password = page.locator('input[name="password"], input[type="password"]')
+    try:
+        return user.count() > 0 and password.count() > 0 and user.first.is_visible()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def perform_login(page, username: str, password: str, login_url: str | None) -> None:
+    log_step("Пробую войти как пользователь (browser login)")
+    if login_url:
+        log_step(f"Открываю страницу логина: {login_url}")
+        page.goto(login_url, wait_until="networkidle", timeout=60000)
+
+    if not login_form_visible(page):
+        # some SPAs show login via hash tab
+        for selector in ['a[href="#login"]', 'text=Вход', 'text=Войти']:
+            try:
+                loc = page.locator(selector).first
+                if loc.count() > 0 and loc.is_visible():
+                    log_info(f"Кликаю вкладку/ссылку входа: {selector}")
+                    loc.click()
+                    page.wait_for_timeout(500)
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+
+    if not login_form_visible(page):
+        log_fail("Форма логина не найдена на странице")
+        raise SystemExit(1)
+
+    log_ok("Форма логина найдена")
+    user_input = page.locator(
+        'input[name="username"], input[type="email"], input[placeholder*="почт" i]'
+    ).first
+    pass_input = page.locator('input[name="password"], input[type="password"]').first
+    submit = page.locator(
+        'form button[type="submit"], button[type="submit"], button:has-text("Войти")'
+    ).first
+
+    log_step(f"Ввожу логин: {username}")
+    user_input.fill("")
+    user_input.fill(username)
+    log_step("Ввожу пароль: ********")
+    pass_input.fill("")
+    pass_input.fill(password)
+
+    before_url = page.url
+    log_step('Нажимаю "Войти"')
+    submit.click()
+
+    # wait until login form disappears or URL/title changes away from login
+    deadline_error = None
+    try:
+        page.wait_for_function(
+            """() => {
+                const title = (document.title || '').toLowerCase();
+                const hasPass = !!document.querySelector('input[type="password"]');
+                const loginTitle = title.includes('вход') || title.includes('login');
+                return !(hasPass && loginTitle);
+            }""",
+            timeout=LOGIN_TIMEOUT_MS,
+        )
+        page.wait_for_load_state("networkidle", timeout=30000)
+    except Exception as exc:  # noqa: BLE001
+        deadline_error = exc
+
+    still_login = login_form_visible(page) or "вход" in (page.title() or "").lower()
+    if still_login:
+        # try to capture visible error text
+        err = ""
+        for sel in [".alert", ".error", "[class*='error']", "[class*='invalid']", "form"]:
+            try:
+                text = page.locator(sel).first.inner_text(timeout=1000)
+                if text and len(text) < 300 and ("ошиб" in text.lower() or "невер" in text.lower() or "парол" in text.lower()):
+                    err = text.strip()
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+        details = f" ({err})" if err else ""
+        log_fail(f"Логин не удался — всё ещё страница входа{details}")
+        if deadline_error:
+            log_info(f"Детали ожидания: {deadline_error}")
+        raise SystemExit(1)
+
+    log_ok(f"Вход выполнен. URL сейчас: {page.url} (было: {before_url})")
+    log_info(f"Заголовок: {page.title()}")
+
+
+def apply_cookies_to_session(session: requests.Session, cookies) -> None:
+    log_step("Переношу cookies из браузера в requests-сессию")
+    count = 0
+    for cookie in cookies:
+        session.cookies.set(
+            cookie["name"],
+            cookie["value"],
+            domain=cookie.get("domain"),
+            path=cookie.get("path", "/"),
+        )
+        count += 1
+    log_ok(f"Cookies перенесены: {count}")
+
+
 def capture_with_browser(
     page_url: str,
     wait_ms: int,
-) -> tuple[list[str], list[Finding]]:
+    username: str | None = None,
+    password: str | None = None,
+    login_url: str | None = None,
+) -> tuple[list[str], list[Finding], list[dict]]:
     log_step("Запускаю браузер (Playwright) для ловли динамических JS и API")
     try:
         from playwright.sync_api import sync_playwright
@@ -580,75 +689,114 @@ def capture_with_browser(
     script_urls: list[str] = []
     network_findings: list[Finding] = []
     seen_net: set[str] = set()
+    cookie_list: list[dict] = []
 
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            context = browser.new_context(user_agent=HEADERS["User-Agent"])
-            page = context.new_page()
+            try:
+                context = browser.new_context(
+                    user_agent=HEADERS["User-Agent"],
+                    locale="ru-RU",
+                    viewport={"width": 1365, "height": 900},
+                )
+                page = context.new_page()
 
-            def on_request(request) -> None:
-                url = request.url
-                resource = request.resource_type
-                if resource in {"script", "worker"}:
-                    if url not in script_urls:
-                        script_urls.append(url)
-                        log_info(f"Браузер загрузил JS: {url}")
-                    return
+                def on_request(request) -> None:
+                    url = request.url
+                    resource = request.resource_type
+                    if resource in {"script", "worker"}:
+                        if url not in script_urls:
+                            script_urls.append(url)
+                            log_info(f"Браузер загрузил JS: {url}")
+                        return
 
-                if resource not in {"xhr", "fetch"}:
-                    return
-                if url in seen_net:
-                    return
-                seen_net.add(url)
-                ctx = f"runtime-network method={request.method} type={resource}"
-                score, reasons = score_candidate(url, ctx + " video search api")
-                # for runtime, keep weaker API-like xhr too
-                if score < 3 and any(h in url.lower() for h in API_HINTS + VIDEO_HINTS + SEARCH_HINTS):
-                    score = max(score, 4)
-                    reasons = list(dict.fromkeys(reasons + ["runtime-api"]))
-                if score >= 3:
-                    network_findings.append(
-                        Finding(
-                            url=url,
-                            source=f"browser:{page_url}",
-                            kind=f"runtime:{resource}",
-                            score=score,
-                            reasons=tuple(reasons) if reasons else ("seen-in-browser",),
-                            context=ctx,
+                    if resource not in {"xhr", "fetch"}:
+                        return
+                    if url in seen_net:
+                        return
+                    seen_net.add(url)
+                    ctx = f"runtime-network method={request.method} type={resource}"
+                    score, reasons = score_candidate(url, ctx + " video search api")
+                    if score < 3 and any(
+                        h in url.lower() for h in API_HINTS + VIDEO_HINTS + SEARCH_HINTS
+                    ):
+                        score = max(score, 4)
+                        reasons = list(dict.fromkeys(reasons + ["runtime-api"]))
+                    if score >= 3:
+                        network_findings.append(
+                            Finding(
+                                url=url,
+                                source=f"browser:{page_url}",
+                                kind=f"runtime:{resource}",
+                                score=score,
+                                reasons=tuple(reasons) if reasons else ("seen-in-browser",),
+                                context=ctx,
+                            )
                         )
-                    )
-                    log_ok(f"Браузер поймал API-запрос: {url}")
+                        log_ok(f"Браузер поймал API-запрос: {url}")
 
-            page.on("request", on_request)
-            log_step(f"Открываю страницу в браузере: {page_url}")
-            page.goto(page_url, wait_until="networkidle", timeout=60000)
-            log_ok("Страница открыта, жду дополнительные загрузки")
-            page.wait_for_timeout(wait_ms)
+                page.on("request", on_request)
+                log_step(f"Открываю страницу в браузере: {page_url}")
+                page.goto(page_url, wait_until="networkidle", timeout=60000)
+                log_ok(f"Страница открыта: {page.url} | {page.title()}")
 
-            # also collect script tags present after hydration
-            for src in page.eval_on_selector_all(
-                "script[src]",
-                "els => els.map(e => e.src).filter(Boolean)",
-            ):
-                if src not in script_urls:
-                    script_urls.append(src)
+                if username and password:
+                    if login_form_visible(page) or login_url:
+                        perform_login(page, username, password, login_url=login_url)
+                        log_step(f"Перехожу на целевую страницу после логина: {page_url}")
+                        page.goto(page_url, wait_until="networkidle", timeout=60000)
+                        if login_form_visible(page):
+                            log_fail("После логина целевая страница снова показывает форму входа")
+                            raise SystemExit(1)
+                        log_ok(
+                            f"Целевая страница открыта под пользователем: {page.url} | {page.title()}"
+                        )
+                    else:
+                        log_info(
+                            "Форма логина не нужна — похоже, уже авторизованы или логин не требуется"
+                        )
+                elif login_form_visible(page):
+                    log_info("Вижу форму логина, но логин/пароль не переданы — продолжаю как гость")
 
-            browser.close()
+                log_step("Жду дополнительные загрузки после открытия")
+                page.wait_for_timeout(wait_ms)
+
+                for src in page.eval_on_selector_all(
+                    "script[src]",
+                    "els => els.map(e => e.src).filter(Boolean)",
+                ):
+                    if src not in script_urls:
+                        script_urls.append(src)
+
+                cookie_list = context.cookies()
+            finally:
+                browser.close()
+    except SystemExit:
+        raise
     except Exception as exc:  # noqa: BLE001
         log_fail(f"Браузерный режим упал: {exc}")
         raise SystemExit(1) from exc
 
     log_ok(f"Браузер: JS-файлов замечено — {len(script_urls)}")
     log_ok(f"Браузер: сетевых API-кандидатов — {len(network_findings)}")
-    return script_urls, network_findings
+    return script_urls, network_findings, cookie_list
 
 
-def analyze_page(page_url: str, deep: bool = True, use_browser: bool = False, wait_ms: int = DEFAULT_BROWSER_WAIT_MS) -> list[Finding]:
+def analyze_page(
+    page_url: str,
+    deep: bool = True,
+    use_browser: bool = False,
+    wait_ms: int = DEFAULT_BROWSER_WAIT_MS,
+    username: str | None = None,
+    password: str | None = None,
+    login_url: str | None = None,
+) -> list[Finding]:
     log("=" * 60)
     log_step(f"Старт анализа страницы: {page_url}")
     log_info(f"Глубокий обход JS: {'да' if deep else 'нет'}")
     log_info(f"Браузерный режим: {'да' if use_browser else 'нет'}")
+    log_info(f"Логин: {'да (' + username + ')' if username else 'нет'}")
     log("=" * 60)
 
     session = requests.Session()
@@ -657,9 +805,17 @@ def analyze_page(page_url: str, deep: bool = True, use_browser: bool = False, wa
     seed_js: list[str] = []
 
     if use_browser:
-        browser_js, network_hits = capture_with_browser(page_url, wait_ms=wait_ms)
+        browser_js, network_hits, cookies = capture_with_browser(
+            page_url,
+            wait_ms=wait_ms,
+            username=username,
+            password=password,
+            login_url=login_url,
+        )
         seed_js.extend(browser_js)
         findings.extend(network_hits)
+        if cookies:
+            apply_cookies_to_session(session, cookies)
 
     html = fetch_text(session, page_url, label="HTML страницы")
     if html is None and not seed_js:
@@ -835,25 +991,54 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_BROWSER_WAIT_MS,
         help="Сколько ждать после загрузки в --browser (мс)",
     )
+    parser.add_argument(
+        "--username",
+        default=os.getenv("FIND_VIDEO_API_USER") or os.getenv("LK_USERNAME"),
+        help="Логин/email для входа (или env FIND_VIDEO_API_USER / LK_USERNAME)",
+    )
+    parser.add_argument(
+        "--password",
+        default=os.getenv("FIND_VIDEO_API_PASSWORD") or os.getenv("LK_PASSWORD"),
+        help="Пароль для входа (или env FIND_VIDEO_API_PASSWORD / LK_PASSWORD)",
+    )
+    parser.add_argument(
+        "--login-url",
+        default=None,
+        help="Отдельный URL страницы логина, если отличается от целевой",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     deep = not args.no_deep
+    username = args.username
+    password = args.password
+    use_browser = args.browser or bool(username and password)
+
+    if (username and not password) or (password and not username):
+        log_fail("Нужны и --username, и --password (или оба через env)")
+        raise SystemExit(2)
+
+    if username and password and not args.browser:
+        log_info("Логин указан — автоматически включаю --browser")
 
     log_step("Запуск find_video_api")
     log_info(f"Цель: {args.url}")
     log_info(
         f"Режим: {'все API' if args.all_api else 'video/search'}, "
-        f"min-score={args.min_score}, deep={deep}, browser={args.browser}"
+        f"min-score={args.min_score}, deep={deep}, browser={use_browser}, "
+        f"login={'yes' if username else 'no'}"
     )
 
     findings = analyze_page(
         args.url,
         deep=deep,
-        use_browser=args.browser,
+        use_browser=use_browser,
         wait_ms=args.wait_ms,
+        username=username,
+        password=password,
+        login_url=args.login_url,
     )
 
     log_step("Фильтрую кандидатов")
