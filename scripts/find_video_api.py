@@ -246,8 +246,13 @@ def looks_like_js_url(url: str) -> bool:
 def score_candidate(url: str, context: str) -> tuple[int, list[str]]:
     url_l = url.lower()
     ctx_l = context.lower()
+    path = urlparse(url).path
     score = 0
     reasons: list[str] = []
+
+    # Too generic roots like "/api" or "/api/" are usually noise.
+    if re.fullmatch(r"/api/?", path, flags=re.I):
+        return 0, ["too-generic"]
 
     if looks_like_asset(url) and not any(
         h in url_l for h in ("api", "graphql", "search", "video", "media")
